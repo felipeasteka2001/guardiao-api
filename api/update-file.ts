@@ -16,6 +16,8 @@ function requireEnv(name: string): string {
 
 function assertAllowedFile(filename: string): string {
   const allowed = [
+    "PROJECT_BLUEPRINT.md",
+    "CHANGELOG.md",
     "00_REGRAS_DO_AGENT.md",
     "01_CAMPAIGN_STATE.md",
     "02_PERSONAGEM_E_PODERES.md",
