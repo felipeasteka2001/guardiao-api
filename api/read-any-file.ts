@@ -13,21 +13,37 @@ function normalizePath(path: string): string {
 function isSafePath(path: string): boolean {
   if (!path) return false;
 
-  const blockedPatterns = [
-    "..",
-    ".env",
-    "node_modules",
-    ".git",
+  const normalized = normalizePath(path);
+
+  if (normalized.includes("..")) return false;
+
+  if (normalized === ".env" || normalized.startsWith(".env/")) return false;
+  if (normalized.includes("/.env")) return false;
+
+  const blockedExactPaths = [
     "package.json",
     "package-lock.json",
     "yarn.lock",
     "pnpm-lock.yaml",
-    "vercel.json",
-    "api/",
-    ".github/"
+    "vercel.json"
   ];
 
-  return !blockedPatterns.some((pattern) => path.includes(pattern));
+  if (blockedExactPaths.includes(normalized)) return false;
+
+  const blockedSegments = [
+    "node_modules",
+    ".git",
+    ".github",
+    "api"
+  ];
+
+  const segments = normalized.split("/");
+
+  if (segments.some((segment) => blockedSegments.includes(segment))) {
+    return false;
+  }
+
+  return true;
 }
 
 async function githubGetFile(path: string) {
