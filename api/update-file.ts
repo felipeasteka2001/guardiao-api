@@ -1,7 +1,7 @@
 type UpdateMode = "append" | "replace";
 
 type UpdateFilePayload = {
-  filename?: string;
+  path?: string;
   mode?: UpdateMode;
   content?: string;
   reason?: string;
@@ -14,37 +14,61 @@ function requireEnv(name: string): string {
   return value;
 }
 
-function assertAllowedFile(filename: string): string {
-  const allowed = [
-    "PROJECT_BLUEPRINT.md",
-    "CHANGELOG.md",
-    "00_REGRAS_DO_AGENT.md",
-    "01_CAMPAIGN_STATE.md",
-    "02_PERSONAGEM_E_PODERES.md",
-    "03_LEDGER_NUMERICO.md",
-    "04_SESSION_LOGS_DETALHADOS.md",
-    "05_INDICE_DE_CANON.md",
-    "06_SEGREDOS_DO_MESTRE.md",
-    "07_BESTIARIO_E_DUNGEONS.md",
-    "08_ACTIONS_E_CHECKPOINTS.md",
-    "README_ORGANIZACAO.md"
-  ];
-
-  if (!allowed.includes(filename)) {
-    throw new Error(`Arquivo não permitido: ${filename}`);
-  }
-
-  return filename;
+function normalizePath(path: string): string {
+  return path.replace(/^\/+/, "").trim();
 }
 
-async function githubGetFile(filename: string) {
+function isSafePath(path: string): boolean {
+  if (!path) return false;
+
+  const normalized = normalizePath(path);
+
+  if (normalized.includes("..")) return false;
+
+  if (normalized === ".env" || normalized.startsWith(".env/")) return false;
+  if (normalized.includes("/.env")) return false;
+
+  const blockedExactPaths = [
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "vercel.json"
+  ];
+
+  if (blockedExactPaths.includes(normalized)) return false;
+
+  const blockedSegments = [
+    "node_modules",
+    ".git",
+    ".github",
+    "api"
+  ];
+
+  const segments = normalized.split("/");
+
+  if (segments.some((segment) => blockedSegments.includes(segment))) {
+    return false;
+  }
+
+  return true;
+}
+
+async function githubGetFile(path: string) {
   const token = requireEnv("GITHUB_TOKEN");
   const owner = requireEnv("GITHUB_OWNER");
   const repo = requireEnv("GITHUB_REPO");
   const branch = process.env.GITHUB_BRANCH || "main";
 
-  const path = assertAllowedFile(filename);
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${branch}`;
+  const safePath = normalizePath(path);
+
+  if (!isSafePath(safePath)) {
+    throw new Error(`Path não permitido: ${path}`);
+  }
+
+  const encodedPath = encodeURIComponent(safePath).replace(/%2F/g, "/");
+
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}?ref=${branch}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -61,26 +85,38 @@ async function githubGetFile(filename: string) {
     throw new Error(`GitHub GET error ${response.status}: ${JSON.stringify(data)}`);
   }
 
+  if (data.type !== "file") {
+    throw new Error(`Path não é um arquivo: ${safePath}`);
+  }
+
   const content = Buffer.from(data.content, "base64").toString("utf8");
 
   return {
+    path: data.path,
     sha: data.sha,
     content,
     html_url: data.html_url
   };
 }
 
-async function githubPutFile(filename: string, content: string, sha: string, reason: string) {
+async function githubPutFile(path: string, content: string, sha: string, reason: string) {
   const token = requireEnv("GITHUB_TOKEN");
   const owner = requireEnv("GITHUB_OWNER");
   const repo = requireEnv("GITHUB_REPO");
   const branch = process.env.GITHUB_BRANCH || "main";
 
-  const path = assertAllowedFile(filename);
-  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+  const safePath = normalizePath(path);
+
+  if (!isSafePath(safePath)) {
+    throw new Error(`Path não permitido: ${path}`);
+  }
+
+  const encodedPath = encodeURIComponent(safePath).replace(/%2F/g, "/");
+
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 
   const body = {
-    message: `Atualizar ${filename}: ${reason || "update do Guardião"}`,
+    message: `Atualizar ${safePath}: ${reason || "update do Guardião"}`,
     content: Buffer.from(content, "utf8").toString("base64"),
     sha,
     branch
@@ -129,7 +165,10 @@ function buildUpdatedContent(oldContent: string, payload: UpdateFilePayload): st
 export default async function handler(req: any, res: any) {
   try {
     if (req.method !== "POST") {
-      return res.status(405).json({ ok: false, error: "Use POST." });
+      return res.status(405).json({
+        ok: false,
+        error: "Use POST."
+      });
     }
 
     const expectedKey = requireEnv("GUARDIAO_API_KEY");
@@ -143,24 +182,35 @@ export default async function handler(req: any, res: any) {
       : receivedKeyRaw;
 
     if (!receivedKey || String(receivedKey).trim() !== expectedKey.trim()) {
-      return res.status(401).json({ ok: false, error: "Unauthorized" });
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized"
+      });
     }
 
     const payload = req.body as UpdateFilePayload;
-    const filename = payload.filename;
+    const path = payload.path;
 
-    if (!filename || typeof filename !== "string") {
+    if (!path || typeof path !== "string") {
       return res.status(400).json({
         ok: false,
-        error: "filename é obrigatório."
+        error: "path é obrigatório."
+      });
+    }
+
+    const safePath = normalizePath(path);
+
+    if (!isSafePath(safePath)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Path não permitido: ${safePath}`
       });
     }
 
     if (payload.require_explicit_permission !== true) {
       return res.status(403).json({
         ok: false,
-        error:
-          "Alteração bloqueada. require_explicit_permission precisa ser true."
+        error: "Alteração bloqueada. require_explicit_permission precisa ser true."
       });
     }
 
@@ -173,11 +223,11 @@ export default async function handler(req: any, res: any) {
       });
     }
 
-    const current = await githubGetFile(filename);
+    const current = await githubGetFile(safePath);
     const updatedContent = buildUpdatedContent(current.content, payload);
 
     const result = await githubPutFile(
-      filename,
+      safePath,
       updatedContent,
       current.sha,
       payload.reason || "alteração autorizada"
@@ -185,8 +235,8 @@ export default async function handler(req: any, res: any) {
 
     return res.status(200).json({
       ok: true,
-      message: `${filename} atualizado com sucesso.`,
-      filename,
+      message: `${safePath} atualizado com sucesso.`,
+      path: safePath,
       mode,
       html_url: result.content?.html_url
     });
