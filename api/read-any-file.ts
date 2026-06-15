@@ -3,6 +3,21 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const GITHUB_API = "https://api.github.com";
 
+type ErrorWithStatus = Error & {
+  statusCode?: number;
+};
+
+type GitHubFileResponse = {
+  type?: string;
+  path?: string;
+  sha?: string;
+  content?: string;
+  encoding?: string;
+  size?: number;
+  html_url?: string;
+  download_url?: string;
+};
+
 function requireEnv(name: string): string {
   const value = process.env[name];
 
@@ -21,23 +36,13 @@ function normalizePath(path: string): string {
 }
 
 /**
- * Permissão máxima dentro do repositório configurado.
+ * Permissão máxima de leitura dentro do repositório configurado.
  *
- * Qualquer path não vazio será permitido.
- *
- * Isso inclui:
- * - campaigns/
- * - checkpoints/
- * - systems/
- * - templates/
- * - api/
- * - .github/
- * - .env
- * - package.json
- * - vercel.json
- * - qualquer outro arquivo presente no repositório
+ * Qualquer arquivo existente no repositório poderá ser lido.
+ * O acesso continua limitado ao GITHUB_OWNER, GITHUB_REPO
+ * e GITHUB_BRANCH configurados na Vercel.
  */
-function isSafePath(path: string): boolean {
+function isAllowedPath(path: string): boolean {
   const normalized = normalizePath(path);
 
   return normalized.length > 0;
@@ -51,6 +56,16 @@ function getHeaderValue(
   }
 
   return value;
+}
+
+function createError(
+  message: string,
+  statusCode: number
+): ErrorWithStatus {
+  const error = new Error(message) as ErrorWithStatus;
+  error.statusCode = statusCode;
+
+  return error;
 }
 
 async function readResponseBody(response: Response): Promise<unknown> {
@@ -69,6 +84,29 @@ async function readResponseBody(response: Response): Promise<unknown> {
   }
 }
 
+function buildGitHubFileUrl(
+  owner: string,
+  repo: string,
+  branch: string,
+  path: string
+): string {
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+  const baseUrl = [
+    GITHUB_API,
+    "repos",
+    encodeURIComponent(owner),
+    encodeURIComponent(repo),
+    "contents",
+    encodedPath
+  ].join("/");
+
+  return baseUrl + "?ref=" + encodeURIComponent(branch);
+}
+
 async function githubGetFile(path: string) {
   const token = requireEnv("GITHUB_TOKEN");
   const owner = requireEnv("GITHUB_OWNER");
@@ -77,27 +115,16 @@ async function githubGetFile(path: string) {
 
   const normalizedPath = normalizePath(path);
 
-  if (!isSafePath(normalizedPath)) {
-    const error = new Error("Path vazio ou inválido.");
-    Object.assign(error, {
-      statusCode: 400
-    });
-
-    throw error;
+  if (!isAllowedPath(normalizedPath)) {
+    throw createError("Path vazio ou inválido.", 400);
   }
 
-  const encodedOwner = encodeURIComponent(owner);
-  const encodedRepo = encodeURIComponent(repo);
-  const encodedBranch = encodeURIComponent(branch);
-
-  const encodedPath = normalizedPath
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-
-  const url =
-    `${GITHUB_API}/repos/${encodedOwner}/${encodedRepo}` +
-    `/contents/${encodedPath}?ref=${encodedBranch}`;
+  const url = buildGitHubFileUrl(
+    owner,
+    repo,
+    branch,
+    normalizedPath
+  );
 
   console.log("[read-any-file] Reading GitHub file", {
     owner,
@@ -120,73 +147,50 @@ async function githubGetFile(path: string) {
   const data = await readResponseBody(response);
 
   if (!response.ok) {
-    let statusCode = 500;
-
     if (response.status === 404) {
-      statusCode = 404;
+      throw createError(
+        `Arquivo não encontrado: ${normalizedPath}`,
+        404
+      );
     }
 
     if (response.status === 401 || response.status === 403) {
-      statusCode = 502;
+      throw createError(
+        `GitHub authentication error ${response.status}: ${JSON.stringify(data)}`,
+        502
+      );
     }
 
-    const error = new Error(
-      `GitHub error ${response.status}: ${JSON.stringify(data)}`
+    throw createError(
+      `GitHub error ${response.status}: ${JSON.stringify(data)}`,
+      500
     );
-
-    Object.assign(error, {
-      statusCode
-    });
-
-    throw error;
   }
 
-  if (!data || typeof data !== "object") {
-    const error = new Error("Resposta inválida recebida do GitHub.");
-
-    Object.assign(error, {
-      statusCode: 500
-    });
-
-    throw error;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw createError(
+      "Resposta inválida recebida do GitHub.",
+      500
+    );
   }
 
-  const githubData = data as {
-    type?: string;
-    path?: string;
-    sha?: string;
-    content?: string;
-    encoding?: string;
-    size?: number;
-    html_url?: string;
-    download_url?: string;
-  };
+  const githubData = data as GitHubFileResponse;
 
   if (githubData.type !== "file") {
-    const error = new Error(
-      `O path informado não é um arquivo: ${normalizedPath}`
+    throw createError(
+      `O path informado não é um arquivo: ${normalizedPath}`,
+      400
     );
-
-    Object.assign(error, {
-      statusCode: 400
-    });
-
-    throw error;
   }
 
   if (
     githubData.encoding !== "base64" ||
     typeof githubData.content !== "string"
   ) {
-    const error = new Error(
-      `O conteúdo do arquivo não foi retornado em base64: ${normalizedPath}`
+    throw createError(
+      `O conteúdo do arquivo não foi retornado em base64: ${normalizedPath}`,
+      500
     );
-
-    Object.assign(error, {
-      statusCode: 500
-    });
-
-    throw error;
   }
 
   const base64Content = githubData.content.replace(/\s/g, "");
@@ -284,16 +288,13 @@ export default async function handler(
         ? error.message
         : String(error);
 
-    let statusCode = 500;
-
-    if (
+    const statusCode =
       typeof error === "object" &&
       error !== null &&
       "statusCode" in error &&
       typeof error.statusCode === "number"
-    ) {
-      statusCode = error.statusCode;
-    }
+        ? error.statusCode
+        : 500;
 
     console.error("[read-any-file] Error", {
       statusCode,
