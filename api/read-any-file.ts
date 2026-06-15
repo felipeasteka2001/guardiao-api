@@ -1,4 +1,3 @@
-```ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const GITHUB_API = "https://api.github.com";
